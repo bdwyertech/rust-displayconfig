@@ -1,4 +1,3 @@
-// Rust FFI bindings for MonitorPanel.framework using objc crate
 // This provides access to detailed display mode information not available via Core Graphics
 
 use core_graphics::display::CGDirectDisplayID;
