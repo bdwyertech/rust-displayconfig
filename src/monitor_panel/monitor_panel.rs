@@ -224,4 +224,24 @@ impl MPDisplayMode {
     pub unsafe fn mode_number(&self) -> i32 {
         msg_send![self.obj, modeNumber]
     }
+
+    /// Return the underlying Objective-C object pointer as a usize.
+    pub unsafe fn object_ptr(&self) -> usize {
+        self.obj as usize
+    }
+
+    /// Return the Objective-C `-description` for the mode, if available.
+    /// This often contains more internal metadata useful for debugging.
+    pub unsafe fn description(&self) -> Option<String> {
+        let desc: *mut Object = msg_send![self.obj, description];
+        if desc.is_null() {
+            return None;
+        }
+        let cstr: *const i8 = msg_send![desc, UTF8String];
+        if cstr.is_null() {
+            return None;
+        }
+        let c_str = std::ffi::CStr::from_ptr(cstr);
+        Some(c_str.to_string_lossy().into_owned())
+    }
 }
