@@ -2,9 +2,6 @@
 
 Some resolutions and capabilities are hidden by Mac OS.  Not sure why, but this can help you find and set them.
 
-A simple Rust application demonstrating how to use macOS's private SkyLight framework from Rust.
-
-
 ### Usage
 ```shell
 displayconfig list
