@@ -6,7 +6,9 @@ use clap::{Parser, Subcommand};
 mod monitor_panel;
 
 mod commands;
-use crate::commands::{get_display_mode, list_displays, set_display_mode};
+use crate::commands::{
+    get_brightness, get_display_mode, list_displays, set_brightness, set_display_mode, watch,
+};
 
 #[derive(Parser)]
 #[command(name = "displayconfig")]
@@ -43,6 +45,25 @@ enum Commands {
         #[arg(short, long)]
         mode: i32,
     },
+    /// Get the current brightness percentage for displays
+    GetBrightness {
+        /// Filter by display ID
+        #[arg(short, long)]
+        display: Option<u32>,
+    },
+    /// Set the brightness percentage for a specific display
+    SetBrightness {
+        /// Display ID to configure
+        #[arg(short, long)]
+        display: u32,
+
+        /// Brightness percentage (0-100)
+        #[arg(short, long)]
+        brightness: u32,
+    },
+
+    /// Watch for display configuration changes and print events.
+    Watch {},
 }
 
 fn main() {
@@ -57,6 +78,18 @@ fn main() {
         }
         Commands::SetMode { display, mode } => {
             set_display_mode(display, *mode);
+        }
+        Commands::GetBrightness { display } => {
+            get_brightness(*display);
+        }
+        Commands::SetBrightness {
+            display,
+            brightness,
+        } => {
+            set_brightness(*display, *brightness);
+        }
+        Commands::Watch {} => {
+            watch();
         }
     }
 }
