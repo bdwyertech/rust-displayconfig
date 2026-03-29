@@ -1,6 +1,11 @@
 // Display management utility for macOS
 // Uses Core Graphics and MonitorPanel.framework APIs
+//
+// The `unexpected_cfgs` warnings originate from the `objc` 0.2 crate's `sel_impl!` macro
+// checking for `feature = "cargo-clippy"`, which is no longer a valid cfg value.
+#![allow(unexpected_cfgs)]
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod monitor_panel;
@@ -17,6 +22,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+
 #[derive(Subcommand)]
 enum Commands {
     /// List all displays and their available modes
@@ -61,35 +67,22 @@ enum Commands {
         #[arg(short, long)]
         brightness: u32,
     },
-
     /// Watch for display configuration changes and print events.
     Watch {},
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::List { verbose, display } => {
-            list_displays(*verbose, *display);
-        }
-        Commands::GetMode { display } => {
-            get_display_mode(display);
-        }
-        Commands::SetMode { display, mode } => {
-            set_display_mode(display, *mode);
-        }
-        Commands::GetBrightness { display } => {
-            get_brightness(*display);
-        }
+        Commands::List { verbose, display } => list_displays(*verbose, *display),
+        Commands::GetMode { display } => get_display_mode(display),
+        Commands::SetMode { display, mode } => set_display_mode(display, *mode),
+        Commands::GetBrightness { display } => get_brightness(*display),
         Commands::SetBrightness {
             display,
             brightness,
-        } => {
-            set_brightness(*display, *brightness);
-        }
-        Commands::Watch {} => {
-            watch();
-        }
+        } => set_brightness(*display, *brightness),
+        Commands::Watch {} => watch(),
     }
 }

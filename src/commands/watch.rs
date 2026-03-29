@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use cocoa::appkit::NSApp;
+use anyhow::{Context, Result};
 use core_graphics::display::CGDisplay;
 
-/// Native watcher using CGDisplayRegisterReconfigurationCallback with a polling fallback.
+use crate::monitor_panel::DisplayID;
+
+/// Native watcher using CGDisplayRegisterReconfigurationCallback.
 ///
-/// The CLI prints diagnostics at startup, registers the CoreGraphics callback, then starts
-/// a lightweight polling thread as a fallback so we can confirm changes even if callbacks
-/// aren't being delivered in this environment.
+/// The CLI prints diagnostics at startup, registers the CoreGraphics callback, then
+/// runs the CFRunLoop to receive display reconfiguration events. Ctrl+C triggers
+/// clean shutdown with callback deregistration.
+
 type CGDirectDisplayID = u32;
 type CGDisplayChangeSummaryFlags = u32;
 
@@ -24,10 +28,13 @@ unsafe extern "C" {
         callback: extern "C" fn(CGDirectDisplayID, CGDisplayChangeSummaryFlags, *mut c_void),
         user_info: *mut c_void,
     );
-
     // Run the CoreFoundation run loop so system-delivered callbacks are invoked.
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopStop(rl: *mut c_void);
     fn CFRunLoopRun();
 }
+
+static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn display_reconfig_callback(
     display: CGDirectDisplayID,
@@ -57,26 +64,23 @@ extern "C" fn display_reconfig_callback(
 /// Capture display state (mode triple) for fallback polling.
 ///
 /// Use u64 for width/height to match the CGDisplayMode API return types.
-fn capture_state() -> HashMap<u32, Option<(u64, u64, f64)>> {
-    let mut map: HashMap<u32, Option<(u64, u64, f64)>> = HashMap::new();
-
-    let displays = CGDisplay::active_displays().unwrap_or_else(|_| Vec::new());
-    for id in displays.iter() {
-        let display = CGDisplay::new(*id);
+fn capture_state() -> HashMap<DisplayID, Option<(u64, u64, f64)>> {
+    let mut map = HashMap::new();
+    let displays = CGDisplay::active_displays().unwrap_or_default();
+    for &id in &displays {
+        let display = CGDisplay::new(id);
         let mode = display
             .display_mode()
             .map(|m| (m.width() as u64, m.height() as u64, m.refresh_rate()));
-        map.insert(*id, mode);
+        map.insert(id, mode);
     }
-
     map
 }
 
 /// Register the native reconfiguration callback and keep the process alive.
-/// The CLI's interval is used for the polling fallback only (callback is immediate).
-pub fn watch() {
+pub fn watch() -> Result<()> {
     println!(
-        "Watching for display configuration changes via CGDisplayRegisterReconfigurationCallback..."
+        "Watching for display configuration changes (Ctrl+C to stop)..."
     );
 
     // Diagnostic: show current active displays at startup.
@@ -87,18 +91,32 @@ pub fn watch() {
     );
 
     unsafe {
-        // Register callback; user_info is null for now.
         CGDisplayRegisterReconfigurationCallback(display_reconfig_callback, ptr::null_mut());
     }
 
-    // Initialize the shared NSApplication instance.
-    unsafe {
-        let _app = NSApp();
-        let _ = _app; // drop immediately
-    }
+    // Handle SIGINT/SIGTERM for clean shutdown
+    ctrlc::set_handler(move || {
+        SHOULD_STOP.store(true, Ordering::SeqCst);
+        // Stop the CFRunLoop so the main thread unblocks
+        unsafe {
+            let rl = CFRunLoopGetCurrent();
+            if !rl.is_null() {
+                CFRunLoopStop(rl);
+            }
+        }
+    })
+    .context("Failed to set Ctrl+C handler")?;
 
-    // Run the CFRunLoop so CoreGraphics can deliver display reconfiguration callbacks.
+    // Block on the CFRunLoop so CoreGraphics delivers callbacks
     unsafe {
         CFRunLoopRun();
     }
+
+    // Cleanup: deregister the callback
+    unsafe {
+        CGDisplayRemoveReconfigurationCallback(display_reconfig_callback, ptr::null_mut());
+    }
+
+    println!("\nStopped watching.");
+    Ok(())
 }

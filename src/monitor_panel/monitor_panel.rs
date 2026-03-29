@@ -4,21 +4,33 @@ use core_graphics::display::CGDirectDisplayID;
 use objc::runtime::{Class, Object};
 use objc::{msg_send, sel, sel_impl};
 
+/// Consistent display ID type used throughout the crate.
+pub type DisplayID = u32;
+
 // Safe wrappers for MonitorPanel API
+#[allow(dead_code)]
 pub struct MPDisplayMgr {
     obj: *mut Object,
+    /// Whether this instance was obtained via `alloc`/`init` and therefore
+    /// owns the Objective-C object (must be released on drop).
+    owned: bool,
 }
 
+#[allow(dead_code)]
 pub struct MPDisplay {
     obj: *mut Object,
 }
 
+#[allow(dead_code)]
 pub struct MPDisplayMode {
     obj: *mut Object,
 }
 
+// MARK: - MPDisplayMgr
+
+#[allow(dead_code)]
 impl MPDisplayMgr {
-    /// Create a new MPDisplayMgr instance
+    /// Create a new MPDisplayMgr instance (caller owns the object).
     pub unsafe fn new() -> Option<Self> {
         let cls = Class::get("MPDisplayMgr")?;
         let obj: *mut Object = msg_send![cls, alloc];
@@ -26,19 +38,24 @@ impl MPDisplayMgr {
         if obj.is_null() {
             None
         } else {
-            Some(MPDisplayMgr { obj })
+            Some(MPDisplayMgr { obj, owned: true })
         }
     }
 
-    /// Get the shared MPDisplayMgr instance
+    /// Get the shared MPDisplayMgr singleton (not owned — must NOT be released).
     pub unsafe fn shared() -> Option<Self> {
         let cls = Class::get("MPDisplayMgr")?;
         let obj: *mut Object = msg_send![cls, sharedMgr];
         if obj.is_null() {
             None
         } else {
-            Some(MPDisplayMgr { obj })
+            Some(MPDisplayMgr { obj, owned: false })
         }
+    }
+
+    /// Convenience: try `new()` first, fall back to `shared()`.
+    pub unsafe fn acquire() -> Option<Self> {
+        unsafe { Self::new().or_else(|| Self::shared()) }
     }
 
     /// Get all displays
@@ -70,8 +87,47 @@ impl MPDisplayMgr {
             Some(MPDisplay { obj })
         }
     }
+
+    /// Find a display by its persistent UUID string.
+    /// Returns `None` if no display matches.
+    pub unsafe fn find_display_by_uuid(&self, uuid: &str) -> Option<MPDisplay> {
+        let displays = unsafe { self.displays()? };
+        for display in displays {
+            if let Some(display_uuid) = unsafe { display.uuid() } {
+                if display_uuid.eq_ignore_ascii_case(uuid) {
+                    return Some(display);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a display by its contextual (Core Graphics) display ID.
+    /// Returns `None` if no display matches.
+    pub unsafe fn find_display_by_cg_id(&self, cg_id: DisplayID) -> Option<MPDisplay> {
+        let displays = unsafe { self.displays()? };
+        for display in displays {
+            if unsafe { display.display_id() } == cg_id {
+                return Some(display);
+            }
+        }
+        None
+    }
 }
 
+impl Drop for MPDisplayMgr {
+    fn drop(&mut self) {
+        if self.owned && !self.obj.is_null() {
+            unsafe {
+                let _: () = msg_send![self.obj, release];
+            }
+        }
+    }
+}
+
+// MARK: - MPDisplay
+
+#[allow(dead_code)]
 impl MPDisplay {
     /// Get all modes for this display
     pub unsafe fn all_modes(&self) -> Option<Vec<MPDisplayMode>> {
@@ -93,9 +149,10 @@ impl MPDisplay {
         Some(modes)
     }
 
-    /// Get the display ID
-    pub unsafe fn display_id(&self) -> i32 {
-        msg_send![self.obj, displayID]
+    /// Get the display ID as a consistent DisplayID type.
+    pub unsafe fn display_id(&self) -> DisplayID {
+        let raw: i32 = msg_send![self.obj, displayID];
+        raw as DisplayID
     }
 
     /// Get the display name
@@ -108,7 +165,7 @@ impl MPDisplay {
         if cstr.is_null() {
             return None;
         }
-        let c_str = std::ffi::CStr::from_ptr(cstr);
+        let c_str = unsafe { std::ffi::CStr::from_ptr(cstr) };
         Some(c_str.to_string_lossy().into_owned())
     }
 
@@ -138,7 +195,7 @@ impl MPDisplay {
         if cstr.is_null() {
             return None;
         }
-        let c_str = std::ffi::CStr::from_ptr(cstr);
+        let c_str = unsafe { std::ffi::CStr::from_ptr(cstr) };
         Some(c_str.to_string_lossy().into_owned())
     }
 
@@ -159,6 +216,9 @@ impl MPDisplay {
     }
 }
 
+// MARK: - MPDisplayMode
+
+#[allow(dead_code)]
 impl MPDisplayMode {
     /// Get width
     pub unsafe fn width(&self) -> i32 {
@@ -241,7 +301,7 @@ impl MPDisplayMode {
         if cstr.is_null() {
             return None;
         }
-        let c_str = std::ffi::CStr::from_ptr(cstr);
+        let c_str = unsafe { std::ffi::CStr::from_ptr(cstr) };
         Some(c_str.to_string_lossy().into_owned())
     }
 }

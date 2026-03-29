@@ -1,20 +1,22 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{bail, Result};
 use core_graphics::display::CGDisplay;
 
-use crate::monitor_panel::MPDisplayMgr;
+use crate::monitor_panel::{DisplayID, MPDisplayMgr, MPDisplayMode};
 
-pub fn list_displays(verbose: bool, filter_display: Option<u32>) {
+pub fn list_displays(verbose: bool, filter_display: Option<DisplayID>) -> Result<()> {
     println!("=== Display Information ===\n");
 
     // Get list of active displays
-    let displays = CGDisplay::active_displays().expect("Failed to get displays");
+    let displays = CGDisplay::active_displays().map_err(|e| anyhow::anyhow!("Failed to get displays (CG error: {})", e))?;
 
     // Filter displays if requested
-    let display_ids: Vec<_> = if let Some(id) = filter_display {
+    let display_ids: Vec<DisplayID> = if let Some(id) = filter_display {
         if displays.contains(&id) {
             vec![id]
         } else {
-            eprintln!("Error: Display ID {} not found", id);
-            std::process::exit(1);
+            bail!("Display ID {} not found", id);
         }
     } else {
         displays
@@ -22,23 +24,18 @@ pub fn list_displays(verbose: bool, filter_display: Option<u32>) {
 
     println!("Found {} active display(s):\n", display_ids.len());
 
-    for (idx, display_id) in display_ids.iter().enumerate() {
-        let display = CGDisplay::new(*display_id);
+    for (idx, &display_id) in display_ids.iter().enumerate() {
+        let display = CGDisplay::new(display_id);
 
         println!("Display {}:", idx + 1);
         println!("  Contextual screen id: {}", display_id);
 
         // Get persistent screen ID from MonitorPanel
         unsafe {
-            if let Some(mgr) = MPDisplayMgr::new().or_else(|| MPDisplayMgr::shared()) {
-                if let Some(mp_displays) = mgr.displays() {
-                    for mp_display in mp_displays.iter() {
-                        if mp_display.display_id() == *display_id as i32 {
-                            if let Some(uuid) = mp_display.uuid() {
-                                println!("  Persistent screen id: {}", uuid);
-                            }
-                            break;
-                        }
+            if let Some(mgr) = MPDisplayMgr::acquire() {
+                if let Some(mp_display) = mgr.find_display_by_cg_id(display_id) {
+                    if let Some(uuid) = mp_display.uuid() {
+                        println!("  Persistent screen id: {}", uuid);
                     }
                 }
             }
@@ -60,16 +57,195 @@ pub fn list_displays(verbose: bool, filter_display: Option<u32>) {
 
         // List all available display modes using MonitorPanel framework
         if verbose {
-            list_display_modes(*display_id);
+            list_display_modes(display_id);
         } else {
             println!("  Use --verbose to see all available display modes");
         }
 
         println!();
     }
+
+    Ok(())
 }
 
-fn list_display_modes(display_id: u32) {
+// MARK: - Mode listing (decomposed)
+
+#[derive(Debug)]
+struct ModeEntry {
+    mode_num: i32,
+    width: i32,
+    height: i32,
+    pixels_wide: i32,
+    pixels_high: i32,
+    refresh: i32,
+    scale: f32,
+    is_hidpi: bool,
+    is_retina: bool,
+    is_native: bool,
+    is_default: bool,
+    depth: i32,
+}
+
+/// Collect user-visible modes from an MPDisplay into lightweight entries.
+unsafe fn collect_visible_modes(modes: &[MPDisplayMode]) -> Vec<ModeEntry> {
+    let mut entries = Vec::new();
+
+    for mode in modes {
+        if !unsafe { mode.is_user_visible() } {
+            continue;
+        }
+
+        let depth = parse_depth_from_description(&unsafe { mode.description() });
+
+        entries.push(ModeEntry {
+            mode_num: unsafe { mode.mode_number() },
+            width: unsafe { mode.width() },
+            height: unsafe { mode.height() },
+            pixels_wide: unsafe { mode.pixels_wide() },
+            pixels_high: unsafe { mode.pixels_high() },
+            refresh: unsafe { mode.refresh_rate() },
+            scale: unsafe { mode.scale() },
+            is_hidpi: unsafe { mode.is_hidpi() },
+            is_retina: unsafe { mode.is_retina() },
+            is_native: unsafe { mode.is_native_mode() },
+            is_default: unsafe { mode.is_default_mode() },
+            depth,
+        });
+    }
+
+    entries
+}
+
+/// Parse "depth = N" from an ObjC description string.
+fn parse_depth_from_description(desc: &Option<String>) -> i32 {
+    let Some(d) = desc else { return 0 };
+    let Some(idx) = d.find("depth = ") else {
+        return 0;
+    };
+    let sub = &d[idx + 8..];
+    let end = sub
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(sub.len());
+    sub[..end].trim().parse::<i32>().unwrap_or(0)
+}
+
+/// Determine which mode numbers should be the canonical "Default" per logical-size group.
+///
+/// Build a lightweight list of visible modes with metadata so we can choose a single
+/// canonical "Default" per logical size group (prefer MonitorPanel current_mode(),
+/// otherwise prefer the mode with the highest depth parsed from the mode description).
+/// This avoids showing multiple Default flags for identical logical sizes that differ
+/// only by pixel format/depth.
+fn compute_canonical_defaults(
+    entries: &[ModeEntry],
+    mp_current_mode_num: Option<i32>,
+) -> HashSet<i32> {
+    // Group entries by logical size + scale
+    let mut groups: HashMap<(i32, i32, i32), Vec<&ModeEntry>> = HashMap::new();
+    for e in entries {
+        // use width, height, and scale (as i32 scaled by 100)
+        let scale_key = (e.scale * 100.0).round() as i32;
+        groups.entry((e.width, e.height, scale_key)).or_default().push(e);
+    }
+
+    let mut canonical = HashSet::new();
+    for candidates in groups.values() {
+        // collect candidates that report is_default == true
+        let defaults: Vec<&&ModeEntry> = candidates.iter().filter(|e| e.is_default).collect();
+        if defaults.is_empty() {
+            continue;
+        }
+
+        // If MP exposes current mode, prefer it when present
+        if let Some(mp_num) = mp_current_mode_num {
+            if let Some(found) = defaults.iter().find(|e| e.mode_num == mp_num) {
+                canonical.insert(found.mode_num);
+                continue;
+            }
+        }
+
+        // Otherwise prefer highest depth
+        let best = defaults.iter().max_by_key(|e| e.depth).unwrap();
+        canonical.insert(best.mode_num);
+    }
+
+    canonical
+}
+
+/// Check if a mode entry matches the current display mode.
+/// Prefer MonitorPanel's current_mode() if available, otherwise fallback to CG.
+fn is_current_mode(
+    entry: &ModeEntry,
+    mp_current_mode_num: Option<i32>,
+    cg_current_mode: &Option<core_graphics::display::CGDisplayMode>,
+) -> bool {
+    if let Some(mp_num) = mp_current_mode_num {
+        return mp_num == entry.mode_num;
+    }
+
+    if let Some(cg_mode) = cg_current_mode {
+        let cg_w = cg_mode.width() as f64;
+        let cg_h = cg_mode.height() as f64;
+        let cg_refresh = cg_mode.refresh_rate();
+
+        let refresh_match = (cg_refresh - (entry.refresh as f64)).abs() < 1.0;
+        let expected_pw = (cg_w * (entry.scale as f64)).round();
+        let expected_ph = (cg_h * (entry.scale as f64)).round();
+        let pixels_match = (expected_pw - entry.pixels_wide as f64).abs() < 1.0
+            && (expected_ph - entry.pixels_high as f64).abs() < 1.0;
+        let logical_match =
+            (cg_w - entry.width as f64).abs() < 0.1 && (cg_h - entry.height as f64).abs() < 0.1;
+
+        return logical_match && refresh_match && pixels_match;
+    }
+
+    false
+}
+
+/// Format a single mode entry into a display string.
+fn format_mode_entry(entry: &ModeEntry, canonical_defaults: &HashSet<i32>, is_current: bool) -> String {
+    let pixel_suffix = if entry.pixels_wide != entry.width || entry.pixels_high != entry.height {
+        format!(" ({}x{} pixels)", entry.pixels_wide, entry.pixels_high)
+    } else {
+        String::new()
+    };
+
+    let scale_suffix = if entry.scale != 1.0 {
+        format!(" scale={:.1}x", entry.scale)
+    } else {
+        String::new()
+    };
+
+    let mut flags = Vec::new();
+    if entry.is_hidpi {
+        flags.push("HiDPI");
+    }
+    if entry.is_retina {
+        flags.push("Retina");
+    }
+    if entry.is_native {
+        flags.push("Native");
+    }
+    if entry.is_default && canonical_defaults.contains(&entry.mode_num) {
+        flags.push("Default");
+    }
+    if is_current {
+        flags.push("Current");
+    }
+
+    let flags_str = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", flags.join(", "))
+    };
+
+    format!(
+        "Mode #{}: {}x{}{} @ {}Hz{}{}",
+        entry.mode_num, entry.width, entry.height, pixel_suffix, entry.refresh, scale_suffix, flags_str
+    )
+}
+
+fn list_display_modes(display_id: DisplayID) {
     println!("  Available modes:");
     unsafe {
         // Get CGDisplay's current mode so we can mark the corresponding
@@ -77,181 +253,58 @@ fn list_display_modes(display_id: u32) {
         let cg_current_mode = CGDisplay::new(display_id).display_mode();
 
         // Try both new() and shared() methods
-        let mgr = MPDisplayMgr::new().or_else(|| MPDisplayMgr::shared());
-
-        if let Some(mgr) = mgr {
-            // Try to get displays array
-            if let Some(mp_displays) = mgr.displays() {
-                // Try to find our display by iterating through all displays
-                let mut found = false;
-                for mp_display in mp_displays.iter() {
-                    let mp_id = mp_display.display_id();
-                    if mp_id == display_id as i32 {
-                        found = true;
-
-                        if let Some(modes) = mp_display.all_modes() {
-                            println!("    Found {} total modes\n", modes.len());
-
-                            // NOTE: Removed verbose description/pointer diagnostics
-                            // to keep mode listing concise per user request.
-
-                            // Try to get MonitorPanel's authoritative current mode number.
-                            // If present, prefer this exact mode_number as the single
-                            // authoritative current entry. Otherwise fall back to
-                            // the CG-based heuristic used previously.
-                            let mp_current_mode_num: Option<i32> = mp_display
-                                .current_mode()
-                                .and_then(|m| Some(m.mode_number()));
-
-                            // Separate HiDPI and non-HiDPI modes with their mode numbers for sorting
-                            let mut hidpi_modes: Vec<(i32, String)> = Vec::new();
-                            let mut standard_modes: Vec<(i32, String)> = Vec::new();
-
-                            for mode in modes.iter() {
-                                let width = mode.width();
-                                let height = mode.height();
-                                let pixels_wide = mode.pixels_wide();
-                                let pixels_high = mode.pixels_high();
-                                let refresh = mode.refresh_rate();
-                                let scale = mode.scale();
-                                let mode_num = mode.mode_number();
-                                let is_hidpi = mode.is_hidpi();
-                                let is_retina = mode.is_retina();
-                                let is_native = mode.is_native_mode();
-                                let is_default = mode.is_default_mode();
-                                let is_visible = mode.is_user_visible();
-
-                                // Only show user-visible modes
-                                if is_visible {
-                                    let mut mode_info = format!(
-                                        "Mode #{}: {}x{}{} @ {}Hz{}{}",
-                                        mode_num,
-                                        width,
-                                        height,
-                                        if pixels_wide != width || pixels_high != height {
-                                            format!(" ({}x{} pixels)", pixels_wide, pixels_high)
-                                        } else {
-                                            String::new()
-                                        },
-                                        refresh,
-                                        if scale != 1.0 {
-                                            format!(" scale={:.1}x", scale)
-                                        } else {
-                                            String::new()
-                                        },
-                                        {
-                                            let mut flags = Vec::new();
-                                            if is_hidpi {
-                                                flags.push("HiDPI");
-                                            }
-                                            if is_retina {
-                                                flags.push("Retina");
-                                            }
-                                            if is_native {
-                                                flags.push("Native");
-                                            }
-                                            if is_default {
-                                                flags.push("Default");
-                                            }
-                                            if !flags.is_empty() {
-                                                format!(" [{}]", flags.join(", "))
-                                            } else {
-                                                String::new()
-                                            }
-                                        }
-                                    );
-
-                                    // Decide current-mode marking. If MonitorPanel
-                                    // exposes a `currentMode`, prefer its `modeNumber`
-                                    // as the authoritative single current mode. If not
-                                    // available, fall back to the CG-derived heuristic
-                                    // used previously (logical size + refresh + pixels).
-                                    let mut is_current = false;
-
-                                    if let Some(mp_num) = mp_current_mode_num {
-                                        if mp_num == mode_num {
-                                            is_current = true;
-                                        }
-                                    } else if let Some(cg_mode) = &cg_current_mode {
-                                        // Use floating-point comparisons to tolerate minor
-                                        // differences in reported refresh rates and scaling.
-                                        let cg_w_f = cg_mode.width() as f64;
-                                        let cg_h_f = cg_mode.height() as f64;
-                                        let cg_refresh = cg_mode.refresh_rate();
-
-                                        let refresh_match =
-                                            (cg_refresh - (refresh as f64)).abs() < 1.0;
-
-                                        // Compute whether the MonitorPanel mode's pixel
-                                        // dimensions equal the CG mode's logical dims
-                                        // multiplied by the mode's scale. This narrows
-                                        // down HiDPI duplicate entries.
-                                        let expected_pixels_w = (cg_w_f * (scale as f64)).round();
-                                        let expected_pixels_h = (cg_h_f * (scale as f64)).round();
-                                        let pixels_match =
-                                            (expected_pixels_w - (pixels_wide as f64)).abs() < 1.0
-                                                && (expected_pixels_h - (pixels_high as f64)).abs()
-                                                    < 1.0;
-
-                                        // Basic logical size match
-                                        let logical_size_match = (cg_w_f - (width as f64)).abs()
-                                            < 0.1
-                                            && (cg_h_f - (height as f64)).abs() < 0.1;
-
-                                        if logical_size_match && refresh_match && pixels_match {
-                                            is_current = true;
-                                        }
-                                    }
-
-                                    if is_current {
-                                        mode_info.push_str(" [Current]");
-                                    }
-
-                                    // No extra diagnostics appended here (keeps output concise)
-
-                                    if is_hidpi || is_retina {
-                                        hidpi_modes.push((mode_num, mode_info));
-                                    } else {
-                                        standard_modes.push((mode_num, mode_info));
-                                    }
-                                }
-                            }
-
-                            // Sort modes by mode number
-                            hidpi_modes.sort_by_key(|(mode_num, _)| *mode_num);
-                            standard_modes.sort_by_key(|(mode_num, _)| *mode_num);
-
-                            // Display HiDPI modes first
-                            if !hidpi_modes.is_empty() {
-                                println!("    HiDPI/Retina Modes:");
-                                for (_, mode_info) in hidpi_modes {
-                                    println!("      {}", mode_info);
-                                }
-                                println!();
-                            }
-
-                            // Then standard modes
-                            if !standard_modes.is_empty() {
-                                println!("    Standard Modes:");
-                                for (_, mode_info) in standard_modes {
-                                    println!("      {}", mode_info);
-                                }
-                            }
-                        } else {
-                            println!("    (no modes available for this display)");
-                        }
-                        break;
-                    }
-                }
-
-                if !found {
-                    println!("    (display ID {} not found in MonitorPanel)", display_id);
-                }
-            } else {
-                println!("    (no displays array available from manager)");
-            }
-        } else {
+        let Some(mgr) = MPDisplayMgr::acquire() else {
             println!("    (MonitorPanel manager not available)");
+            return;
+        };
+        let Some(mp_display) = mgr.find_display_by_cg_id(display_id) else {
+            println!("    (display ID {} not found in MonitorPanel)", display_id);
+            return;
+        };
+        let Some(modes) = mp_display.all_modes() else {
+            println!("    (no modes available for this display)");
+            return;
+        };
+
+        println!("    Found {} total modes\n", modes.len());
+
+        let mp_current_mode_num = mp_display.current_mode().map(|m| m.mode_number());
+        let entries = collect_visible_modes(&modes);
+        let canonical_defaults = compute_canonical_defaults(&entries, mp_current_mode_num);
+
+        let mut hidpi_modes: Vec<(i32, String)> = Vec::new();
+        let mut standard_modes: Vec<(i32, String)> = Vec::new();
+
+        for entry in &entries {
+            let current = is_current_mode(entry, mp_current_mode_num, &cg_current_mode);
+            let line = format_mode_entry(entry, &canonical_defaults, current);
+
+            if entry.is_hidpi || entry.is_retina {
+                hidpi_modes.push((entry.mode_num, line));
+            } else {
+                standard_modes.push((entry.mode_num, line));
+            }
+        }
+
+        // Sort modes by mode number
+        hidpi_modes.sort_by_key(|(n, _)| *n);
+        standard_modes.sort_by_key(|(n, _)| *n);
+
+        // Display HiDPI modes first
+        if !hidpi_modes.is_empty() {
+            println!("    HiDPI/Retina Modes:");
+            for (_, info) in &hidpi_modes {
+                println!("      {}", info);
+            }
+            println!();
+        }
+
+        // Then standard modes
+        if !standard_modes.is_empty() {
+            println!("    Standard Modes:");
+            for (_, info) in &standard_modes {
+                println!("      {}", info);
+            }
         }
     }
 }

@@ -1,5 +1,7 @@
-use crate::monitor_panel::MPDisplayMgr;
+use anyhow::{bail, Result};
 use core_graphics::display::CGDisplay;
+
+use crate::monitor_panel::{DisplayID, MPDisplayMgr};
 
 // Link to CoreDisplay framework for brightness functions
 #[link(name = "CoreDisplay", kind = "framework")]
@@ -8,20 +10,19 @@ unsafe extern "C" {
     fn CoreDisplay_Display_GetUserBrightness(display: u32) -> f64;
 }
 
-pub fn set_brightness(display_id: u32, brightness: u32) {
+pub fn set_brightness(display_id: DisplayID, brightness: u32) -> Result<()> {
     // Validate brightness percentage
     if brightness > 100 {
-        eprintln!("Error: Brightness must be between 0 and 100");
-        std::process::exit(1);
+        bail!("Brightness must be between 0 and 100");
     }
 
     // Get list of active displays
-    let displays = CGDisplay::active_displays().expect("Failed to get displays");
+    // Get list of active displays
+    let displays = CGDisplay::active_displays().map_err(|e| anyhow::anyhow!("Failed to get displays (CG error: {})", e))?;
 
     // Check if display exists
     if !displays.contains(&display_id) {
-        eprintln!("Error: Display ID {} not found", display_id);
-        std::process::exit(1);
+        bail!("Display ID {} not found", display_id);
     }
 
     let display = CGDisplay::new(display_id);
@@ -31,15 +32,10 @@ pub fn set_brightness(display_id: u32, brightness: u32) {
 
     // Get persistent screen ID from MonitorPanel for display info
     unsafe {
-        if let Some(mgr) = MPDisplayMgr::new().or_else(|| MPDisplayMgr::shared()) {
-            if let Some(mp_displays) = mgr.displays() {
-                for mp_display in mp_displays.iter() {
-                    if mp_display.display_id() == display_id as i32 {
-                        if let Some(uuid) = mp_display.uuid() {
-                            println!("Persistent screen id: {}", uuid);
-                        }
-                        break;
-                    }
+        if let Some(mgr) = MPDisplayMgr::acquire() {
+            if let Some(mp_display) = mgr.find_display_by_cg_id(display_id) {
+                if let Some(uuid) = mp_display.uuid() {
+                    println!("Persistent screen id: {}", uuid);
                 }
             }
         }
@@ -50,7 +46,7 @@ pub fn set_brightness(display_id: u32, brightness: u32) {
 
     // Get current brightness before setting
     let current_brightness = unsafe { CoreDisplay_Display_GetUserBrightness(display_id) };
-    if current_brightness >= 0.0 && current_brightness <= 1.0 {
+    if (0.0..=1.0).contains(&current_brightness) {
         let current_percentage = (current_brightness * 100.0).round() as u32;
         println!("Current brightness: {}%", current_percentage);
     }
@@ -65,4 +61,6 @@ pub fn set_brightness(display_id: u32, brightness: u32) {
 
     println!("New brightness: {}%", brightness);
     println!("\nBrightness updated successfully!");
+
+    Ok(())
 }
