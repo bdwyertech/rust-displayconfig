@@ -1,9 +1,5 @@
 // Display management utility for macOS
 // Uses Core Graphics and MonitorPanel.framework APIs
-//
-// The `unexpected_cfgs` warnings originate from the `objc` 0.2 crate's `sel_impl!` macro
-// checking for `feature = "cargo-clippy"`, which is no longer a valid cfg value.
-#![allow(unexpected_cfgs)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
