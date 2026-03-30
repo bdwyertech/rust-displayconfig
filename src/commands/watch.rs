@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::{Context, Result};
 use core_graphics::display::CGDisplay;
@@ -29,12 +29,13 @@ unsafe extern "C" {
         user_info: *mut c_void,
     );
     // Run the CoreFoundation run loop so system-delivered callbacks are invoked.
-    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopGetMain() -> *mut c_void;
     fn CFRunLoopStop(rl: *mut c_void);
     fn CFRunLoopRun();
 }
 
-static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+/// Stores the main thread's CFRunLoop pointer so the signal handler can stop it.
+static MAIN_RUN_LOOP: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 extern "C" fn display_reconfig_callback(
     display: CGDirectDisplayID,
@@ -94,13 +95,17 @@ pub fn watch() -> Result<()> {
         CGDisplayRegisterReconfigurationCallback(display_reconfig_callback, ptr::null_mut());
     }
 
+    // Capture the main thread's run loop *before* we enter it, so the
+    // signal handler (which runs on a different thread) can stop it.
+    let main_rl = unsafe { CFRunLoopGetMain() };
+    MAIN_RUN_LOOP.store(main_rl, Ordering::SeqCst);
+
     // Handle SIGINT/SIGTERM for clean shutdown
     ctrlc::set_handler(move || {
-        SHOULD_STOP.store(true, Ordering::SeqCst);
-        // Stop the CFRunLoop so the main thread unblocks
-        unsafe {
-            let rl = CFRunLoopGetCurrent();
-            if !rl.is_null() {
+        // Stop the main thread's CFRunLoop so it unblocks
+        let rl = MAIN_RUN_LOOP.load(Ordering::SeqCst);
+        if !rl.is_null() {
+            unsafe {
                 CFRunLoopStop(rl);
             }
         }
